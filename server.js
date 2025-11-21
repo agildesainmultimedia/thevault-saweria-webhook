@@ -1,8 +1,6 @@
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
-const Database = require('better-sqlite3');
-const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -12,91 +10,26 @@ app.use(cors());
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// Initialize SQLite database
-const db = new Database(process.env.DATABASE_PATH || 'donations.db');
+// In-memory storage (akan reset saat server restart)
+let donationQueue = [];
+let topSpenders = {};
+let lastRawData = null;
 
-// Create tables
-db.exec(`
-  CREATE TABLE IF NOT EXISTS donations (
-    id TEXT PRIMARY KEY,
-    username TEXT NOT NULL,
-    display_name TEXT NOT NULL,
-    amount INTEGER NOT NULL,
-    message TEXT,
-    timestamp TEXT NOT NULL,
-    received_at INTEGER NOT NULL,
-    delivered INTEGER DEFAULT 0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
+const MAX_QUEUE_SIZE = 20;
+const DONATION_LIFETIME = 120000; // 2 minutes
 
-  CREATE TABLE IF NOT EXISTS top_spenders (
-    username TEXT PRIMARY KEY,
-    display_name TEXT NOT NULL,
-    total_amount INTEGER NOT NULL,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_delivered ON donations(delivered);
-  CREATE INDEX IF NOT EXISTS idx_received_at ON donations(received_at);
-`);
-
-// Prepared statements
-const insertDonation = db.prepare(`
-  INSERT INTO donations (id, username, display_name, amount, message, timestamp, received_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?)
-`);
-
-const updateTopSpender = db.prepare(`
-  INSERT INTO top_spenders (username, display_name, total_amount)
-  VALUES (?, ?, ?)
-  ON CONFLICT(username) DO UPDATE SET
-    total_amount = total_amount + excluded.total_amount,
-    display_name = excluded.display_name,
-    updated_at = CURRENT_TIMESTAMP
-`);
-
-const markDelivered = db.prepare(`
-  UPDATE donations SET delivered = 1 WHERE id = ?
-`);
-
-const getUndeliveredDonation = db.prepare(`
-  SELECT * FROM donations 
-  WHERE delivered = 0 
-  ORDER BY received_at ASC 
-  LIMIT 1
-`);
-
-const getTopSpenders = db.prepare(`
-  SELECT username, display_name, total_amount 
-  FROM top_spenders 
-  ORDER BY total_amount DESC 
-  LIMIT 10
-`);
-
-const cleanOldDonations = db.prepare(`
-  DELETE FROM donations 
-  WHERE (delivered = 1 AND received_at < ?) 
-     OR (received_at < ?)
-`);
-
-// Utility functions
 function generateDonationId() {
   return Date.now() + '-' + Math.random().toString(36).substr(2, 9);
 }
 
 function cleanupOldDonations() {
   const now = Date.now();
-  const deliveredThreshold = now - 60000; // 1 minute for delivered
-  const undeliveredThreshold = now - 300000; // 5 minutes for undelivered
-  
-  try {
-    const result = cleanOldDonations.run(deliveredThreshold, undeliveredThreshold);
-    if (result.changes > 0) {
-      console.log(`[Cleanup] Removed ${result.changes} old donations`);
-    }
-  } catch (error) {
-    console.error('[Cleanup] Error:', error);
-  }
+  donationQueue = donationQueue.filter(d => {
+    const age = now - d.received_at;
+    if (age > DONATION_LIFETIME) return false;
+    if (d.delivered && age > 30000) return false;
+    return true;
+  });
 }
 
 // Auto-cleanup every 30 seconds
@@ -106,27 +39,23 @@ setInterval(cleanupOldDonations, 30000);
 
 // Health check
 app.get('/', (req, res) => {
-  try {
-    const undelivered = db.prepare('SELECT COUNT(*) as count FROM donations WHERE delivered = 0').get();
-    const total = db.prepare('SELECT COUNT(*) as count FROM donations').get();
-    
-    res.json({
-      status: 'online',
-      server: 'Railway Express + SQLite',
-      queue_undelivered: undelivered.count,
-      queue_total: total.count,
-      endpoints: {
-        saweria: '/saweria (POST)',
-        roblox: '/roblox-check (GET)',
-        confirm: '/roblox-check?confirm=DONATION_ID (GET)',
-        debug: '/debug (GET)',
-        clear: '/clear (POST)',
-        stats: '/stats (GET)'
-      }
-    });
-  } catch (error) {
-    res.status(500).json({ error: 'Database error', details: error.message });
-  }
+  const undelivered = donationQueue.filter(d => !d.delivered).length;
+  
+  res.json({
+    status: 'online',
+    server: 'Railway Express (In-Memory)',
+    queue_undelivered: undelivered,
+    queue_total: donationQueue.length,
+    uptime: process.uptime(),
+    endpoints: {
+      saweria: '/saweria (POST)',
+      roblox: '/roblox-check (GET)',
+      confirm: '/roblox-check?confirm=DONATION_ID (GET)',
+      debug: '/debug (GET)',
+      clear: '/clear (POST)',
+      stats: '/stats (GET)'
+    }
+  });
 });
 
 // Saweria webhook endpoint
@@ -161,34 +90,47 @@ app.post('/saweria', (req, res) => {
       '';
     
     const donationId = generateDonationId();
-    const timestamp = new Date().toISOString();
-    const receivedAt = Date.now();
     
-    // Insert donation
-    insertDonation.run(
-      donationId,
-      username,
-      username, // display_name
-      amount,
-      message,
-      timestamp,
-      receivedAt
-    );
+    const donation = {
+      id: donationId,
+      username: username,
+      display_name: username,
+      amount: amount,
+      message: message,
+      timestamp: new Date().toISOString(),
+      received_at: Date.now(),
+      delivered: false,
+      avatar_url: null
+    };
+
+    // Add to queue
+    donationQueue.push(donation);
     
-    // Update top spender
-    updateTopSpender.run(username, username, amount);
+    // Keep queue size manageable
+    if (donationQueue.length > MAX_QUEUE_SIZE) {
+      donationQueue.shift();
+    }
+
+    // Update top spenders
+    if (!topSpenders[username]) {
+      topSpenders[username] = {
+        username: username,
+        display_name: username,
+        total_amount: 0
+      };
+    }
+    topSpenders[username].total_amount += amount;
     
     console.log('=== DONATION SAVED ===');
     console.log('ID:', donationId);
     console.log('Username:', username);
     console.log('Amount:', amount);
-    
-    const queueCount = db.prepare('SELECT COUNT(*) as count FROM donations WHERE delivered = 0').get();
+    console.log('Queue size:', donationQueue.length);
     
     res.json({
       success: true,
       donation_id: donationId,
-      queue_size: queueCount.count
+      queue_size: donationQueue.filter(d => !d.delivered).length
     });
   } catch (error) {
     console.error('[Saweria] Error:', error);
@@ -206,21 +148,26 @@ app.get('/roblox-check', (req, res) => {
     
     // Handle delivery confirmation
     if (confirmId) {
-      const result = markDelivered.run(confirmId);
-      if (result.changes > 0) {
+      const donation = donationQueue.find(d => d.id === confirmId);
+      if (donation) {
+        donation.delivered = true;
         console.log('[Roblox] Confirmed delivery:', confirmId);
       }
     }
     
     // Get next undelivered donation
-    const donation = getUndeliveredDonation.get();
-    const topSpenders = getTopSpenders.all();
-    const queueCount = db.prepare('SELECT COUNT(*) as count FROM donations WHERE delivered = 0').get();
+    const nextDonation = donationQueue.find(d => !d.delivered);
+    
+    const topSpendersList = Object.values(topSpenders)
+      .sort((a, b) => b.total_amount - a.total_amount)
+      .slice(0, 10);
+    
+    const undelivered = donationQueue.filter(d => !d.delivered).length;
     
     res.json({
-      donation: donation || null,
-      top_spenders: topSpenders,
-      queue_size: queueCount.count,
+      donation: nextDonation || null,
+      top_spenders: topSpendersList,
+      queue_size: undelivered,
       timestamp: new Date().toISOString()
     });
   } catch (error) {
@@ -234,72 +181,55 @@ app.get('/roblox-check', (req, res) => {
 
 // Debug endpoint
 app.get('/debug', (req, res) => {
-  try {
-    const allDonations = db.prepare('SELECT * FROM donations ORDER BY received_at DESC LIMIT 20').all();
-    const topSpenders = getTopSpenders.all();
-    const undelivered = db.prepare('SELECT COUNT(*) as count FROM donations WHERE delivered = 0').get();
-    const total = db.prepare('SELECT COUNT(*) as count FROM donations').get();
-    
-    res.json({
-      donations: allDonations,
-      top_spenders: topSpenders,
-      undelivered_count: undelivered.count,
-      total_count: total.count
-    });
-  } catch (error) {
-    res.status(500).json({
-      error: 'Database error',
-      details: error.message
-    });
-  }
+  const undelivered = donationQueue.filter(d => !d.delivered).length;
+  
+  res.json({
+    last_raw_data: lastRawData,
+    donation_queue: donationQueue,
+    top_spenders: topSpenders,
+    undelivered_count: undelivered,
+    total_count: donationQueue.length
+  });
 });
 
 // Stats endpoint
 app.get('/stats', (req, res) => {
-  try {
-    const stats = {
-      total_donations: db.prepare('SELECT COUNT(*) as count FROM donations').get().count,
-      delivered_donations: db.prepare('SELECT COUNT(*) as count FROM donations WHERE delivered = 1').get().count,
-      pending_donations: db.prepare('SELECT COUNT(*) as count FROM donations WHERE delivered = 0').get().count,
-      total_amount: db.prepare('SELECT SUM(amount) as sum FROM donations').get().sum || 0,
-      unique_donors: db.prepare('SELECT COUNT(DISTINCT username) as count FROM donations').get().count,
-      top_spenders: getTopSpenders.all()
-    };
-    
-    res.json(stats);
-  } catch (error) {
-    res.status(500).json({
-      error: 'Database error',
-      details: error.message
-    });
-  }
+  const delivered = donationQueue.filter(d => d.delivered).length;
+  const pending = donationQueue.filter(d => !d.delivered).length;
+  const totalAmount = donationQueue.reduce((sum, d) => sum + d.amount, 0);
+  
+  res.json({
+    total_donations: donationQueue.length,
+    delivered_donations: delivered,
+    pending_donations: pending,
+    total_amount: totalAmount,
+    unique_donors: Object.keys(topSpenders).length,
+    top_spenders: Object.values(topSpenders)
+      .sort((a, b) => b.total_amount - a.total_amount)
+      .slice(0, 10)
+  });
 });
 
 // Clear endpoint (for testing)
 app.post('/clear', (req, res) => {
-  try {
-    db.exec('DELETE FROM donations');
-    db.exec('DELETE FROM top_spenders');
-    
-    console.log('[Clear] Database cleared');
-    
-    res.json({
-      success: true,
-      message: 'All data cleared'
-    });
-  } catch (error) {
-    res.status(500).json({
-      error: 'Database error',
-      details: error.message
-    });
-  }
+  donationQueue = [];
+  topSpenders = {};
+  lastRawData = null;
+  
+  console.log('[Clear] All data cleared');
+  
+  res.json({
+    success: true,
+    message: 'All data cleared'
+  });
 });
 
 // 404 handler
 app.use((req, res) => {
   res.status(404).json({
     error: 'Not Found',
-    path: req.path
+    path: req.path,
+    message: 'This endpoint does not exist'
   });
 });
 
@@ -317,20 +247,18 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`=================================`);
   console.log(`🚂 Railway Server Started`);
   console.log(`📡 Port: ${PORT}`);
-  console.log(`💾 Database: SQLite`);
+  console.log(`💾 Storage: In-Memory`);
   console.log(`✅ Ready for donations!`);
   console.log(`=================================`);
 });
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
-  console.log('SIGTERM received, closing database...');
-  db.close();
+  console.log('SIGTERM received, shutting down...');
   process.exit(0);
 });
 
 process.on('SIGINT', () => {
-  console.log('SIGINT received, closing database...');
-  db.close();
+  console.log('SIGINT received, shutting down...');
   process.exit(0);
 });
